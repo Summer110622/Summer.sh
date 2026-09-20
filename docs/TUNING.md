@@ -1,36 +1,38 @@
 # Qwen3.5 MoE tuning notes
 
-この文書は `Summer.sh` の既定値を、どの方向に動かすべきか判断するためのメモです。数値はハードウェア横断の最適値ではありません。
+This document explains how to adjust the presets in Summer. The numbers are practical starting points, not hardware-independent optima.
 
-## 1. Qwen3.5 MoE で重要な点
+## 1. Why MoE placement matters
 
-Qwen3.5-35B-A3B と 122B-A10B は、全 parameter を毎 token 使う dense model ではありません。両モデルとも 256 routed experts を持ち、各 token では 8 routed experts と shared expert が使われます。
+Qwen3.5 MoE models do not use every parameter for every token like a dense model. Routed expert weights are a large part of the model, while only a subset of experts is active for each token.
 
-そのため、`llama.cpp` の `--cpu-moe` / `--n-cpu-moe` は特に有用です。attention やその他の tensor を GPU に残しながら、大きな expert weights を CPU RAM 側へ逃がせます。
+That makes the upstream `llama.cpp` options `--cpu-moe` and `--n-cpu-moe` especially useful: attention and other tensors can remain GPU-offloaded while routed expert weights are moved to system RAM.
 
-一方で、generation 中は選択された experts を読む必要があるため、CPU RAM bandwidth や PCIe transfer が bottleneck になり得ます。VRAM が足りるなら、CPU MoE を減らした方が速い場合が多くあります。
+The trade-off is bandwidth. During generation, selected expert weights still need to be read. If RAM bandwidth or CPU-GPU transfer becomes the bottleneck, excessive CPU MoE offload can reduce tokens per second.
 
-## 2. `--fit` を既定にする理由
+If the model already fits comfortably in VRAM, reducing CPU MoE offload will often improve generation speed.
 
-最近の upstream `llama.cpp` は `--fit` により、VRAM に収まるよう未指定の offload parameter を調整できます。
+## 2. Why the presets use `--fit`
 
-`Summer.sh` は原則として:
+Recent upstream `llama.cpp` builds can automatically adjust unspecified offload settings so the model fits in available accelerator memory.
+
+Summer normally generates:
 
 ```text
 --gpu-layers auto --fit on --fit-target <MiB>
 ```
 
-を使います。
+`--fit-target` is the amount of accelerator memory to leave free.
 
-`--fit-target` は accelerator memory に残す余白です。小さすぎると desktop / display / driver / context 増加で OOM しやすくなり、大きすぎると GPU offload が減ります。
+A target that is too small can make the process fragile when the desktop, display driver, context allocation, or another application consumes VRAM. A target that is too large can reduce GPU offload unnecessarily.
 
-開始点:
+Useful starting points:
 
-| 状況 | fit-target |
+| Situation | fit-target |
 |---|---:|
-| 余裕を優先 | 1280 MiB |
-| 標準 | 1024 MiB |
-| VRAM が厳しい | 768 MiB |
+| Extra headroom | 1280 MiB |
+| Balanced | 1024 MiB |
+| Tight VRAM budget | 768 MiB |
 
 ## 3. `balanced`
 
@@ -42,7 +44,7 @@ K/V=q8_0/q8_0
 fit-target=1024 MiB
 ```
 
-最初に throughput と memory 使用量を見るための profile です。MoE placement は `llama.cpp` の fit logic に任せます。
+Use this first. It provides a useful baseline for memory use, prompt processing and generation speed while leaving MoE placement to the `llama.cpp` fit logic.
 
 ## 4. `low-vram`
 
@@ -55,15 +57,25 @@ K/V=q4_0/q4_0
 fit-target=768 MiB
 ```
 
-VRAM を最優先で節約します。全 MoE expert weights を CPU に残すため、GPU が小さい環境でも model を扱いやすくなります。
+This profile prioritizes VRAM savings. All routed expert weights remain on CPU.
 
-速度が低すぎる場合は `--cpu-moe` ではなく `--n-cpu-moe N` を使い、CPU に置く layer 数を減らしてください。
-
-例:
+If it is too slow, do not immediately abandon CPU offload. Try partial MoE offload instead:
 
 ```bash
-bash Summer.sh ... --profile balanced --n-cpu-moe 20
+./Summer.sh \
+  --bin /path/to/llama-cli \
+  --model /path/to/model.gguf \
+  --profile balanced \
+  --n-cpu-moe 20
 ```
+
+Windows:
+
+```powershell
+.\Summer.ps1 --bin "C:\llama.cpp\llama-cli.exe" --model "D:\models\model.gguf" --profile balanced --n-cpu-moe 20
+```
+
+Reduce `N` to move more expert layers back to the GPU.
 
 ## 5. `gpu`
 
@@ -75,9 +87,9 @@ K/V=q8_0/q8_0
 fit-target=1024 MiB
 ```
 
-GPU 側により多く置ける環境向けです。ただし profile 名は「全 tensor を必ず GPU に固定する」という意味ではありません。OOM 回避のため `--fit` を残しています。
+This is a more GPU-oriented starting point. It does **not** force every tensor onto the GPU: `--fit` remains enabled so the launcher can avoid an unnecessary out-of-memory failure.
 
-完全に手動で placement を固定したい場合は、`--` 以降に upstream `llama.cpp` のオプションを渡して比較してください。
+For controlled benchmarking, use raw `llama.cpp` options after `--` to compare a fully manual placement strategy.
 
 ## 6. `long-context`
 
@@ -89,84 +101,137 @@ K/V=q4_0/q4_0
 fit-target=1280 MiB
 ```
 
-context を増やす代わりに KV cache と micro-batch を抑えます。Qwen3.5 の official native context は 262,144 tokens ですが、ローカル推論でその長さをそのまま確保する必要はありません。
+This profile spends more memory on context, so it reduces KV-cache precision and micro-batch size.
 
-32K → 64K → 128K のように段階的に増やし、起動時メモリだけでなく prompt processing と generation の安定性も確認してください。
+Do not jump directly to the model's maximum context unless the workload actually requires it. Increase context progressively, for example:
+
+```text
+32K -> 64K -> 128K
+```
+
+At each step, check:
+
+- model-load stability
+- prompt-processing speed
+- generation speed
+- total RAM/VRAM use
+- whether the requested context leaves enough memory for the rest of the application
 
 ## 7. KV cache
 
-`q8_0/q8_0` はバランスの良い開始点です。VRAM が厳しい場合は `q4_0/q4_0` に落とせます。
+`q8_0/q8_0` is the balanced starting point.
 
-高精度側へ戻す場合:
+For lower VRAM use:
 
-```bash
-bash Summer.sh ... --ctk f16 --ctv f16
+```text
+--ctk q4_0 --ctv q4_0
 ```
 
-長 context では KV cache の型が memory 使用量へ直接効くため、context length とセットで調整してください。
+For higher precision:
 
-## 8. Batch と micro-batch
+```text
+--ctk f16 --ctv f16
+```
 
-`-b` は logical batch、`-ub` は実際に一度に処理する micro-batch です。
+With long contexts, KV-cache type has a direct effect on memory use, so tune it together with context length instead of treating it as an independent switch.
 
-Qwen3.5 の hybrid/recurrent 部分を考えると、dense model で問題なかった大きな `ubatch` が最適とは限りません。OOM や prompt processing の不安定さが出たら、まず `ubatch` を半分にします。
+## 8. Batch and micro-batch
 
-順序としては:
+`-b` is the logical batch size and `-ub` is the physical micro-batch processed at once.
+
+For a hybrid/recurrent architecture, a micro-batch that works well on a conventional dense Transformer is not automatically optimal.
+
+If prompt processing is unstable or runs out of memory, reduce `ubatch` first:
 
 ```text
 256 -> 128 -> 64
 ```
 
-を試し、それでも厳しければ `batch` を下げます。
+If that is not enough, reduce the main batch size.
 
-## 9. MTP
+This preserves as much batching as possible while reducing peak working memory.
 
-Qwen3.5 は MTP training を使っており、current upstream `llama.cpp` には Qwen3.5 MoE の embedded MTP graph があります。
+## 9. MTP speculative decoding
 
-ただし self-speculation の損益は hardware 依存です。CPU offload が大きい構成では verification cost が増え、MTP が逆効果になることがあります。
+Summer can use embedded MTP self-speculation when both the GGUF and the installed `llama.cpp` build expose compatible support.
 
-比較方法:
+Baseline:
 
 ```bash
-# baseline
-bash Summer.sh ... --mtp off --dry-run
-
-# MTP
-bash Summer.sh ... --mtp on --mtp-tokens 2 --dry-run
+./Summer.sh --bin /path/to/llama-cli --model /path/to/model.gguf --mtp off
 ```
 
-実測時は同一 model、同一 context、同一 sampling、同一 prompt で tokens/s と first-token latency を比較してください。
+MTP:
+
+```bash
+./Summer.sh --bin /path/to/llama-cli --model /path/to/model.gguf --mtp on --mtp-tokens 2
+```
+
+The same comparison on Windows:
+
+```powershell
+.\Summer.ps1 --bin "C:\llama.cpp\llama-cli.exe" --model "D:\models\model.gguf" --mtp off
+.\Summer.ps1 --bin "C:\llama.cpp\llama-cli.exe" --model "D:\models\model.gguf" --mtp on --mtp-tokens 2
+```
+
+MTP is not automatically faster on every machine. Heavy CPU offload can increase verification cost enough to erase the speculative-decoding gain.
+
+Benchmark with the same:
+
+- GGUF
+- prompt
+- context length
+- sampling parameters
+- CPU/GPU placement
+
+Compare both tokens/s and first-token latency.
 
 ## 10. Reasoning
 
-`Summer.sh` は reasoning を勝手に無効化せず `auto` を既定にします。
+Summer defaults to:
 
-```bash
-bash Summer.sh ... --reasoning auto
-bash Summer.sh ... --reasoning on
-bash Summer.sh ... --reasoning off
+```text
+--reasoning auto
 ```
 
-Server 利用時は client request の sampling / max_tokens と合わせて設計してください。Thinking を切ると必要 output budget も変わります。
+You can explicitly request:
+
+```text
+--reasoning on
+--reasoning off
+```
+
+For server workloads, also account for request-level sampling and output-token limits. A reasoning workload may require a substantially different output budget from a non-reasoning workload.
 
 ## 11. Sampling
 
-ランチャーは sampling parameter を固定しません。理由は、Qwen3.5 の thinking と non-thinking で推奨例が異なること、`llama-server` では request 単位の parameter が優先されるためです。
+Summer deliberately does not force a sampling preset. Sampling is workload-dependent and, in server mode, is usually controlled by each API request.
 
-CLI で試す場合は `--` 以降に渡せます。
+CLI example:
 
 ```bash
-bash Summer.sh ... -- --temp 1.0 --top-p 0.95 --top-k 20
+./Summer.sh \
+  --bin /path/to/llama-cli \
+  --model /path/to/model.gguf \
+  -- \
+  --temp 1.0 --top-p 0.95 --top-k 20
 ```
 
-## 12. 変更する順番
+PowerShell:
 
-速度または memory を詰める場合、複数の軸を一度に変えない方が原因を追いやすくなります。
+```powershell
+.\Summer.ps1 --bin "C:\llama.cpp\llama-cli.exe" --model "D:\models\model.gguf" -- --temp 1.0 --top-p 0.95 --top-k 20
+```
 
-1. `balanced` で baseline を取る
-2. OOM なら `fit-target` を増やす、または `low-vram`
-3. 遅いなら `--n-cpu-moe` を減らして GPU 側へ戻す
-4. context が必要なら KV cache と `ubatch` を下げながら増やす
-5. 最後に MTP を比較する
+## 12. Recommended tuning order
 
-`llama-bench` を使える環境では、profile を変える前後で prompt processing と token generation を分けて測ると判断しやすくなります。
+Change one major variable at a time.
+
+1. Establish a baseline with `balanced`.
+2. If you run out of VRAM, increase `fit-target` or try `low-vram`.
+3. If generation is too slow, reduce the number of MoE layers kept on CPU.
+4. If you need more context, increase context while reducing KV-cache size and/or `ubatch`.
+5. Benchmark MTP only after memory placement is stable.
+6. Keep the configuration that improves your actual workload, not just model-load success.
+
+If `llama-bench` is available, measure prompt processing and token generation separately. They respond differently to batch size, offload, memory bandwidth and speculative decoding.
